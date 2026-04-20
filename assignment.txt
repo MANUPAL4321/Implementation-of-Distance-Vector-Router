@@ -1,0 +1,148 @@
+Assignment 4: Building a Custom
+Distance-Vector Router
+1. Overview
+In this assignment, you will build your own Routing Daemon from scratch using Python. Your
+software will implement a simplified version of a Distance-Vector protocol (similar to RIP) to
+automatically discover network topologies and calculate the shortest paths between subnets.
+You will deploy your code inside Docker containers, which will act as the physical routers in a
+virtual lab environment.
+
+2. Learning Objectives
+●​
+●​
+●​
+●​
+●​
+
+Implement the Bellman-Ford Algorithm for dynamic path calculation.
+Understand UDP-based protocol communication between network nodes.
+Gain hands-on experience with the Linux Routing Table and the ip route command.
+Analyze and solve the "Count to Infinity" problem using Split Horizon.
+Gain experience with Docker as a dev/test platform.
+
+3. The Lab Topology
+Students will work in teams to build a triangle topology. Each "Router" (Container) is connected
+to two distinct Docker networks.
+●​ Router A: Connected to Net_AB (10.0.1.0/24) and Net_AC (10.0.3.0/24)
+●​ Router B: Connected to Net_AB (10.0.1.0/24) and Net_BC (10.0.2.0/24)
+●​ Router C: Connected to Net_BC (10.0.2.0/24) and Net_AC (10.0.3.0/24)​
+The Goal: If Router A wants to send a packet to Router C, it should know to go through Net_AC
+(1 hop). If you "disconnect" (stop) Router C, Router A must eventually learn that it can reach the
+subnet behind C via Router B.
+
+4. Interoperable Packet Format (DV-JSON)
+To ensure different router implementations can talk to each other, all routing updates must
+
+follow this JSON structure. Updates are sent via UDP to Port 5000.
+
+Packet Structure
+{​
+"router_id": "router ip address",​
+"version": 1.0,​
+"routes": [​
+{​
+"subnet": "10.0.1.0/24",​
+"distance": 0​
+},​
+{​
+"subnet": "10.0.2.0/24",​
+"distance": 1​
+}​
+]​
+}​
+
+Field Definitions:
+●​ router_id: A unique identifier for the sender. The router’s IP address that can serve as the
+next hop destination for the routes advertised.
+●​ version: Protocol version (must be 1.0).
+●​ routes: An array of objects.
+○​ subnet: The CIDR notation of the network being advertised.
+○​ distance: The cost to reach that subnet from the perspective of the sender.
+
+5. The Starter Skeleton
+Use the following skeleton as a starting point. It follows the DV-JSON format defined above. It
+uses environment variables for input to facilitate use with Docker automation.
+import socket​
+import json​
+import threading​
+import time​
+import os​
+​
+# Configuration (to be adjusted per container)
+
+# Environment variables used to facilitate deployment with Docker​
+MY_IP = os.getenv("MY_IP", "127.0.0.1")
+NEIGHBORS = os.getenv("NEIGHBORS", "").split(",")​
+PORT = 5000​
+​
+# Initial Table: { Subnet: [Distance, Next_Hop] }​
+# Example: {"10.0.1.0/24": [0, "0.0.0.0"]}​
+routing_table = {}​
+​
+def broadcast_updates():​
+#TODO: Construct the DV information​
+# encode it into a DV-JSON packet
+# send packet to neighbors ​
+​
+def listen_for_updates():​
+# TODO: receive packet from neighbor
+# update_logic for the received information​
+​
+​
+def update_logic(neighbor_ip, routes_from_neighbor):​
+# TODO: Implement Bellman-Ford​
+# 1. Compare received distances + 1 vs current distances​
+# 2. Update local routing_table​
+# 3. Use 'os.system(f"ip route replace {subnet} via {neighbor_ip}")'​
+​
+​
+if __name__ == "__main__":​
+threading.Thread(target=broadcast_updates, daemon=True).start()​
+listen_for_updates()​
+
+6. Orchestrating with Docker
+Please note that the following is provided as an example. You should modify
+and update your docker environment to run your routers.​
+
+​
+A. Create the Virtual Networks
+docker network create --subnet=10.0.1.0/24 net_ab​
+docker network create --subnet=10.0.2.0/24 net_bc​
+docker network create --subnet=10.0.3.0/24 net_ac​
+
+B. Build the Router Image
+Dockerfile:
+FROM alpine:latest​
+RUN apk add --no-cache python3 iproute2​
+COPY router.py /app/router.py​
+WORKDIR /app​
+CMD ["python3", "router.py"]​
+Build: docker build -t my-router .
+
+C. Deploying the Topology
+Example for Router A:
+# Start on net_ab​
+docker run -d --name router_a --privileged \​
+--network net_ab --ip 10.0.1.1 \​
+-e ROUTER_ID=router_a -e MY_IP=10.0.1.1 -e NEIGHBORS=10.0.1.2,10.0.3.2 \​
+my-router​
+​
+# Attach to net_ac​
+docker network connect net_ac router_a --ip 10.0.3.1​
+
+7. Submission Requirements
+1.​ Code: Your completed router.py, docker files, test scripts, etc.. Please make sure all
+code for the router is in the router.py file.
+2.​ Report: Explaining your design, testing, and a brief log showing the routing table
+convergence. Include a github like to your code. Analysis (part of the report): Explain
+how your implementation prevents routing loops when a link is removed or a node is
+stopped.
+Submissions expected in this folder, due on Monday, April 20, 2026. Please insert the GitHub
+link into this spreadsheet.
+Please be prepared to present your project in class starting in the week of April 20th
+(24th, 27th April). The presentations will be part of the end-of-term evaluations. ​
+​
+Each student should prepare a short 5-minute presentation focused on how they tested their
+code. They should be prepared to answer questions on their code/design.
+
+
