@@ -1,334 +1,300 @@
-import ipaddress
-import json
-import os
 import socket
-import subprocess
+import json
 import threading
 import time
-from typing import Any
+import os
+import ipaddress
+import subprocess
 
-
-PROTOCOL_VERSION = 1.0
-PORT = int(os.getenv("PORT", "5000"))
-INFINITY = int(os.getenv("INFINITY", "16"))
-BROADCAST_INTERVAL = float(os.getenv("BROADCAST_INTERVAL", "5"))
-NEIGHBOR_DEAD_INTERVAL = float(os.getenv("NEIGHBOR_DEAD_INTERVAL", "15"))
-
+# Configuration (to be adjusted per container)
+# Environment variables used to facilitate deployment with Docker
 MY_IP = os.getenv("MY_IP", "127.0.0.1")
-NEIGHBORS = [n.strip() for n in os.getenv("NEIGHBORS", "").split(",") if n.strip()]
-DIRECT_SUBNETS_ENV = [s.strip() for s in os.getenv("DIRECT_SUBNETS", "").split(",") if s.strip()]
-
-DIRECT_SOURCE = "direct"
-NEIGHBOR_SOURCE = "neighbor"
-DIRECT_NEXT_HOP = "0.0.0.0"
-
-RouteEntry = dict[str, Any]
-RoutingTable = dict[str, RouteEntry]
-NeighborState = dict[str, Any]
-
-routing_table: RoutingTable = {}
-neighbor_tables: dict[str, NeighborState] = {}
-state_lock = threading.Lock()
-
-
-def log(message: str) -> None:
-    print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
-
-
-def run_ip_route(args: list[str]) -> None:
-    result = subprocess.run(
-        ["ip", "route", *args],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        error = result.stderr.strip() or result.stdout.strip() or "unknown error"
-        log(f"ip route {' '.join(args)} failed: {error}")
-
-
-def normalize_subnet(value: str) -> str | None:
-    try:
-        return str(ipaddress.ip_network(value, strict=False))
-    except ValueError:
-        return None
-
-
-def make_route(distance: int, next_hop: str, source: str) -> RouteEntry:
-    return {
-        "distance": distance,
-        "next_hop": next_hop,
-        "source": source,
-    }
-
-
-def route_learned_from_neighbor(entry: RouteEntry | None) -> bool:
-    return bool(entry and entry["source"] == NEIGHBOR_SOURCE)
-
-
-def discover_direct_subnets() -> set[str]:
-    discovered = set()
-
-    try:
-        output = subprocess.check_output(
-            ["ip", "-4", "-o", "addr", "show", "scope", "global"],
-            text=True,
-        )
-        for line in output.splitlines():
-            parts = line.split()
-            if "inet" not in parts:
-                continue
-            cidr = parts[parts.index("inet") + 1]
-            network = ipaddress.ip_interface(cidr).network
-            discovered.add(str(network))
-    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
-        log(f"Could not auto-discover subnets from interfaces: {exc}")
-
-    for subnet in DIRECT_SUBNETS_ENV:
-        normalized = normalize_subnet(subnet)
-        if normalized is None:
-            log(f"Ignoring invalid DIRECT_SUBNETS entry: {subnet}")
-            continue
-        discovered.add(normalized)
-
-    return discovered
-
-
-def direct_route_entries() -> RoutingTable:
-    entries: RoutingTable = {}
-    for subnet in sorted(discover_direct_subnets()):
-        entries[subnet] = make_route(0, DIRECT_NEXT_HOP, DIRECT_SOURCE)
-    return entries
-
-
-def init_routing_table() -> None:
-    direct_entries = direct_route_entries()
-    if not direct_entries:
-        log("No direct subnets discovered. Set DIRECT_SUBNETS if discovery fails.")
-
-    with state_lock:
-        routing_table.clear()
-        routing_table.update(direct_entries)
-
-    log(f"Router started with MY_IP={MY_IP}, neighbors={NEIGHBORS}")
-    log(f"Direct subnets: {sorted(direct_entries)}")
-
-
-def validate_packet(packet: dict[str, Any]) -> bool:
-    return (
-        isinstance(packet, dict)
-        and packet.get("version") == PROTOCOL_VERSION
-        and isinstance(packet.get("routes"), list)
-    )
-
-
-def parse_routes(routes: list[dict[str, Any]]) -> dict[str, int]:
-    cleaned: dict[str, int] = {}
-
-    for entry in routes:
-        if not isinstance(entry, dict):
-            continue
-
-        subnet = entry.get("subnet")
-        distance = entry.get("distance")
-
-        if not isinstance(subnet, str):
-            continue
-        subnet = normalize_subnet(subnet)
-        if subnet is None:
-            continue
-
-        try:
-            distance = int(distance)
-        except (ValueError, TypeError):
-            continue
-
-        cleaned[subnet] = max(0, min(distance, INFINITY))
-
-    return cleaned
-
-
-def build_packet(for_neighbor: str | None = None) -> dict[str, Any]:
-    with state_lock:
-        packet_routes = []
-        for subnet, entry in sorted(routing_table.items()):
-            advertised_distance = entry["distance"]
-
-            if (
-                for_neighbor
-                and entry["source"] == NEIGHBOR_SOURCE
-                and entry["next_hop"] == for_neighbor
-            ):
-                advertised_distance = INFINITY
-
-            packet_routes.append(
-                {
-                    "subnet": subnet,
-                    "distance": int(min(advertised_distance, INFINITY)),
-                }
-            )
-
-    return {
-        "router_id": MY_IP,
-        "version": PROTOCOL_VERSION,
-        "routes": packet_routes,
-    }
-
-
-def apply_kernel_route_changes(old_table: RoutingTable, new_table: RoutingTable) -> None:
-    affected_subnets = set(old_table.keys()) | set(new_table.keys())
-
-    for subnet in sorted(affected_subnets):
-        old_entry = old_table.get(subnet)
-        new_entry = new_table.get(subnet)
-
-        old_is_dynamic = route_learned_from_neighbor(old_entry)
-        new_is_dynamic = route_learned_from_neighbor(new_entry)
-
-        if old_is_dynamic and not new_is_dynamic:
-            run_ip_route(["del", subnet])
-            log(f"Removed route {subnet}")
-            continue
-
-        if new_is_dynamic:
-            should_replace = (
-                not old_is_dynamic
-                or old_entry["next_hop"] != new_entry["next_hop"]
-                or old_entry["distance"] != new_entry["distance"]
-            )
-            if should_replace:
-                run_ip_route(["replace", subnet, "via", new_entry["next_hop"]])
-                log(
-                    f"Route {subnet} via {new_entry['next_hop']} "
-                    f"(distance {new_entry['distance']})"
-                )
-
-
-def recompute_routes_locked() -> None:
-    old_table = dict(routing_table)
-    new_table = direct_route_entries()
-    now = time.time()
-
-    expired_neighbors = [
-        neighbor_ip
-        for neighbor_ip, neighbor_state in neighbor_tables.items()
-        if now - neighbor_state["last_seen"] > NEIGHBOR_DEAD_INTERVAL
-    ]
-    for neighbor_ip in expired_neighbors:
-        del neighbor_tables[neighbor_ip]
-
-    for neighbor_ip in list(neighbor_tables.keys()):
-        neighbor_state = neighbor_tables.get(neighbor_ip)
-        if not neighbor_state:
-            continue
-
-        for subnet, neighbor_distance in neighbor_state["routes"].items():
-            if subnet in new_table:
-                continue
-
-            candidate = min(INFINITY, neighbor_distance + 1)
-            if candidate >= INFINITY:
-                continue
-
-            current = new_table.get(subnet)
-            if not current:
-                new_table[subnet] = make_route(candidate, neighbor_ip, NEIGHBOR_SOURCE)
-                continue
-
-            better_distance = candidate < current["distance"]
-            same_distance_better_tie = (
-                candidate == current["distance"] and neighbor_ip < current["next_hop"]
-            )
-            if better_distance or same_distance_better_tie:
-                new_table[subnet] = make_route(candidate, neighbor_ip, NEIGHBOR_SOURCE)
-
-    apply_kernel_route_changes(old_table, new_table)
-    routing_table.clear()
-    routing_table.update(new_table)
-
-
-def broadcast_updates() -> None:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-    while True:
-        for neighbor in NEIGHBORS:
-            packet = build_packet(for_neighbor=neighbor)
-            data = json.dumps(packet).encode("utf-8")
-            try:
-                sock.sendto(data, (neighbor, PORT))
-            except OSError as exc:
-                log(f"[ERROR] send to {neighbor} failed: {exc}")
-        time.sleep(BROADCAST_INTERVAL)
-
-
-def listen_for_updates() -> None:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("0.0.0.0", PORT))
-    log(f"Listening for updates on UDP {PORT}")
-
-    while True:
-        data, addr = sock.recvfrom(65535)
-
-        try:
-            packet = json.loads(data.decode("utf-8"))
-        except json.JSONDecodeError:
-            continue
-
-        if not validate_packet(packet):
-            continue
-
-        # 🔥 FIX: use router_id instead of addr[0]
-        neighbor_id = addr[0] 
-        if not neighbor_id:
-            continue
-
-        routes = parse_routes(packet["routes"])
-
-        with state_lock:
-            neighbor_tables[neighbor_id] = {
-                "last_seen": time.time(),
-                "routes": routes,
-            }
-            recompute_routes_locked()
-
-def maintenance_loop() -> None:
-    while True:
-        with state_lock:
-            recompute_routes_locked()
-        time.sleep(1)
-
-
-def format_routing_table() -> str:
-    rows = []
-    for subnet, entry in sorted(routing_table.items()):
-        rows.append(
-            f"{subnet:<18} dist={entry['distance']:<2} "
-            f"next_hop={entry['next_hop']:<15} source={entry['source']}"
-        )
-
-    if not rows:
-        return "Routing table: (empty)"
-
-    return "Routing table:\n  " + "\n  ".join(rows)
-
-
-def print_table_loop() -> None:
-    while True:
-        with state_lock:
-            table_snapshot = format_routing_table()
-        log(table_snapshot)
-        time.sleep(5)
-
-
-def main() -> None:
-    init_routing_table()
-
-    threading.Thread(target=broadcast_updates, daemon=True).start()
-    threading.Thread(target=maintenance_loop, daemon=True).start()
-    threading.Thread(target=print_table_loop, daemon=True).start()
-
-    listen_for_updates()
+NEIGHBORS = [n for n in os.getenv("NEIGHBORS", "").split(",") if n]
+PORT = 5000
+
+VERSION = 1.0
+INFINITY = 16
+UPDATE_INTERVAL = 5
+ROUTE_TIMEOUT = 15
+GARBAGE_TIME = 30
+
+# Routing Table: { Subnet: {distance, next_hop, updated_at, is_direct} }
+routing_table = {}
+table_lock = threading.Lock()
+trigger_event = threading.Event()
+
+
+def get_local_subnets():
+	subnets = []
+	try:
+		output = subprocess.check_output(["ip", "-o", "-4", "addr", "show"], text=True)
+	except Exception:
+		return subnets
+
+	for line in output.splitlines():
+		parts = line.split()
+		if len(parts) < 4:
+			continue
+		iface = parts[1]
+		if iface == "lo":
+			continue
+		cidr = parts[3]
+		try:
+			network = ipaddress.ip_interface(cidr).network
+		except ValueError:
+			continue
+		subnets.append(str(network))
+	return subnets
+
+
+def get_iface_for_ip(target_ip):
+	try:
+		output = subprocess.check_output(["ip", "-o", "-4", "addr", "show"], text=True)
+	except Exception:
+		return None
+
+	target = ipaddress.ip_address(target_ip)
+	for line in output.splitlines():
+		parts = line.split()
+		if len(parts) < 4:
+			continue
+		iface = parts[1]
+		if iface == "lo":
+			continue
+		cidr = parts[3]
+		try:
+			network = ipaddress.ip_interface(cidr).network
+		except ValueError:
+			continue
+		if target in network:
+			return iface
+	return None
+
+
+def get_local_ip_for_neighbor(neighbor_ip):
+	try:
+		output = subprocess.check_output(["ip", "-o", "-4", "addr", "show"], text=True)
+	except Exception:
+		return MY_IP
+
+	target = ipaddress.ip_address(neighbor_ip)
+	for line in output.splitlines():
+		parts = line.split()
+		if len(parts) < 4:
+			continue
+		if parts[1] == "lo":
+			continue
+		try:
+			interface = ipaddress.ip_interface(parts[3])
+		except ValueError:
+			continue
+		if target in interface.network:
+			return str(interface.ip)
+	return MY_IP
+
+
+def route_via_neighbor(subnet, neighbor_ip):
+	iface = get_iface_for_ip(neighbor_ip)
+	if iface:
+		return os.system(f"ip route replace {subnet} via {neighbor_ip} dev {iface} onlink")
+	return os.system(f"ip route replace {subnet} via {neighbor_ip} onlink")
+
+
+def delete_route_via_neighbor(subnet, neighbor_ip):
+	iface = get_iface_for_ip(neighbor_ip)
+	if iface:
+		return os.system(f"ip route del {subnet} via {neighbor_ip} dev {iface}")
+	return os.system(f"ip route del {subnet} via {neighbor_ip}")
+
+
+def init_routing_table():
+	now = time.time()
+	for subnet in get_local_subnets():
+		routing_table[subnet] = {
+			"distance": 0,
+			"next_hop": "0.0.0.0",
+			"updated_at": now,
+			"is_direct": True,
+		}
+
+
+def refresh_direct_subnets():
+	now = time.time()
+	current_direct_subnets = set(get_local_subnets())
+	# Add new direct subnets
+	for subnet in current_direct_subnets:
+		current = routing_table.get(subnet)
+		if current is None or not current.get("is_direct"):
+			routing_table[subnet] = {
+				"distance": 0,
+				"next_hop": "0.0.0.0",
+				"updated_at": now,
+				"is_direct": True,
+			}
+	# Remove vanished direct subnets
+	vanished = []
+	for subnet, info in list(routing_table.items()):
+		if info.get("is_direct") and subnet not in current_direct_subnets:
+			vanished.append(subnet)
+	changed = False
+	for subnet in vanished:
+		del routing_table[subnet]
+		# Delete kernel route
+		os.system(f"ip route del {subnet}")
+		print(f"[LOST] Direct subnet {subnet} removed (link down)")
+		changed = True
+	if changed:
+		trigger_event.set()
+
+
+def build_routes_for_neighbor(neighbor_ip):
+	routes = []
+	for subnet, info in routing_table.items():
+		distance = info["distance"]
+		if not info["is_direct"] and info["next_hop"] == neighbor_ip:
+			distance = INFINITY
+		routes.append({"subnet": subnet, "distance": min(distance, INFINITY)})
+	return routes
+
+
+def broadcast_updates():
+	sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+	while True:
+		trigger_event.wait(timeout=UPDATE_INTERVAL)
+		trigger_event.clear()
+
+		with table_lock:
+			for neighbor in NEIGHBORS:
+				sender_ip = get_local_ip_for_neighbor(neighbor)
+				packet = {
+					"router_id": sender_ip,
+					"version": VERSION,
+					"routes": build_routes_for_neighbor(neighbor),
+				}
+				data = json.dumps(packet).encode("utf-8")
+				try:
+					sock.sendto(data, (neighbor, PORT))
+				except OSError:
+					continue
+
+
+def listen_for_updates():
+	sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+	sock.bind(("0.0.0.0", PORT))
+	while True:
+		data, addr = sock.recvfrom(65535)
+		try:
+			packet = json.loads(data.decode("utf-8"))
+		except (json.JSONDecodeError, UnicodeDecodeError):
+			continue
+
+		if packet.get("version") != VERSION:
+			continue
+		routes = packet.get("routes")
+		if not isinstance(routes, list):
+			continue
+
+		neighbor_ip = packet.get("router_id") or addr[0]
+		update_logic(neighbor_ip, routes)
+
+
+def update_logic(neighbor_ip, routes_from_neighbor):
+	changed = False
+	now = time.time()
+
+	with table_lock:
+		for route in routes_from_neighbor:
+			subnet = route.get("subnet")
+			distance = route.get("distance")
+			if not subnet or not isinstance(distance, (int, float)):
+				continue
+			distance = int(distance)
+			new_dist = min(distance + 1, INFINITY)
+			current = routing_table.get(subnet)
+
+			if current and current.get("is_direct"):
+				continue
+
+			if current is None:
+				if new_dist < INFINITY:
+					routing_table[subnet] = {
+						"distance": new_dist,
+						"next_hop": neighbor_ip,
+						"updated_at": now,
+						"is_direct": False,
+					}
+					route_via_neighbor(subnet, neighbor_ip)
+					print(f"[ADD] {subnet} via {neighbor_ip} dist {new_dist}")
+					changed = True
+				continue
+
+			if current["next_hop"] == neighbor_ip:
+				if new_dist >= INFINITY:
+					if current["distance"] < INFINITY:
+						delete_route_via_neighbor(subnet, neighbor_ip)
+					current["distance"] = INFINITY
+					current["updated_at"] = now
+					print(f"[DOWN] {subnet} via {neighbor_ip} dist {INFINITY}")
+					changed = True
+				else:
+					if new_dist != current["distance"]:
+						route_via_neighbor(subnet, neighbor_ip)
+						current["distance"] = new_dist
+						current["updated_at"] = now
+						print(f"[UPD] {subnet} via {neighbor_ip} dist {new_dist}")
+						changed = True
+					else:
+						current["updated_at"] = now
+			else:
+				if new_dist < current["distance"]:
+					routing_table[subnet] = {
+						"distance": new_dist,
+						"next_hop": neighbor_ip,
+						"updated_at": now,
+						"is_direct": False,
+					}
+					route_via_neighbor(subnet, neighbor_ip)
+					print(f"[BETTER] {subnet} via {neighbor_ip} dist {new_dist}")
+					changed = True
+
+	if changed:
+		trigger_event.set()
+
+
+def route_aging_loop():
+	while True:
+		now = time.time()
+		changed = False
+		with table_lock:
+			refresh_direct_subnets()
+			for subnet, info in list(routing_table.items()):
+				if info["is_direct"]:
+					continue
+
+				age = now - info["updated_at"]
+				if info["distance"] < INFINITY and age > ROUTE_TIMEOUT:
+					delete_route_via_neighbor(subnet, info["next_hop"])
+					info["distance"] = INFINITY
+					info["updated_at"] = now
+					print(f"[TIMEOUT] {subnet} via {info['next_hop']}")
+					changed = True
+					continue
+
+				if info["distance"] >= INFINITY and age > GARBAGE_TIME:
+					print(f"[GC] {subnet}")
+					del routing_table[subnet]
+					changed = True
+
+		if changed:
+			trigger_event.set()
+		time.sleep(1)
 
 
 if __name__ == "__main__":
-    main()
+	with table_lock:
+		init_routing_table()
+	print(f"[START] my_ip={MY_IP} neighbors={NEIGHBORS} direct_subnets={list(routing_table.keys())}")
+
+	threading.Thread(target=broadcast_updates, daemon=True).start()
+	threading.Thread(target=route_aging_loop, daemon=True).start()
+	listen_for_updates()
